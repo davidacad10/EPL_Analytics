@@ -1,0 +1,147 @@
+---
+title: "EPL_Ranking"
+author: "David Babu"
+date: "9/26/2020"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Pairwise ranking have multiple use cases in fields like search ranking optimization, Product Comparison etc. and holds edge over traditional cumulative comparison as with the former we will be able to say A is n% better than B/C/D..etc. by also prioritizing the effect of each variable by the corresponding relevance. The theory behind the method is detailed in the previous article of this series:Link  
+
+
+Assuming that, we now have a brief idea on how the pairwise ranking is applied behind the curtains, we will have an interesting application, where we try to predict the table standings of English Premier League at the end of the current season 2020-21. The parameter we would use to rank teams would be the head to head results in the last 5 matches. It’s quite interesting to see how close it gets to real table standings when applied to 2019-20 season on validation.
+
+
+## Case In Action
+
+The parameter we would use to rank teams is the head to head results each team had in the last 5 matches.A win is awarded 3,draw 1 and loss 0, just as it is in EPL.So the maximum rating a team can have is 15 and minimum is 0. The objective we are aiming for is predicting the final standings at the end of the season, at the very beginning of the season without even a match being played.[We can try more real time models for a match by match prediction later :D].
+
+Just as in every data science problem,the important part is to get the data ready.There are quite a lot of good sources available. I have collected the match by match result from 2004 from football.com and collated to a single file.You can download the raw data from this link.
+
+
+Let's load the data and get to it:
+
+```{r}
+library(rio)
+library(dplyr)
+library(xgboost)
+library(knitr)
+rm(list = ls())
+data=import("Pairwise_Ranking_Data.xlsx")
+data=data%>%
+  mutate(Season_Start_Date=as.Date(Season_Start_Date)
+         ,Season_End_Date=as.Date(Season_End_Date)
+         ,Prev_SSD=as.Date(Prev_SSD)
+         ,Prev_SED1=as.Date(Prev_SED1))
+```
+
+The dataframe have the H2H results from 2004 season, with ratings as described before.On the first week of the season the H2H available is those of last seasons. Hence for every season N, the rank will be the final table standings the team had on season N+1. For example,at the end of season 2018-19,when Chelsea had a 9 point over Man City and 6 point over Liverpool, they ended up finishing 3rd the next season 2019-20.Hence for a team Ti, the H2H over all the teams T at the end of season N,will be the parameters used to predict rank in season N+1.      
+
+Let's divide the data into train and test.There was a shift in EPL after the 2012-13 season, where all the teams got highly competitive.So we can select train data from 2013-14 season to 2018-19. We can test the model created for 2019-20 which itself can be called as an outlier season for many reasons (Covid-19,Liverpool winning title etc. :D).
+
+```{r}
+train=data%>%filter(Prev_SSD<=as.Date('2018-08-10'))%>%
+  filter(Prev_SSD>=as.Date('2013-08-01'))
+
+test1=data%>%filter(Prev_SSD>as.Date('2018-08-10'))
+##Getting the previous records available for the promoted teams
+##And adding into the 17 other teams to have the whole 20 team records
+promoted=c("Norwich","Sheffield United","Aston Villa")
+test2=data%>%filter(Team1%in%promoted)%>%
+  ungroup()%>%
+  group_by(Team1)%>%
+  arrange(desc(Season_Start_Date))%>%
+  mutate(rpp=row_number())%>%
+  filter(rpp==1)%>%
+  select(-rpp)
+test=bind_rows(test1,test2)
+
+
+train_data=train%>%ungroup()%>%select(Arsenal:Wolves)
+test_data=test%>%ungroup()%>%select(Arsenal:Wolves)
+target=as.numeric(as.character(train$Rank)) 
+
+```
+
+```{r}
+set.seed(1000)
+xgbTrain <- xgb.DMatrix(as.matrix(train_data), label = train$Rank)
+xgbTest <- xgb.DMatrix(as.matrix(test_data))
+
+```
+
+```{r}
+
+
+##No extra parameter tuning being applied except ntress=5000 and
+#early stopping round as 20 
+params <- list(booster = 'gbtree',
+               objective = 'rank:pairwise')
+
+##Metric used is NDCG as described in tutorial
+rankModel <- xgb.train(params, xgbTrain, 5000, watchlist = list(tr = xgbTrain), eval_metric = 'ndcg'
+                       ,early_stopping_rounds = 20)
+
+pred=(predict(rankModel, xgbTest,reshape = TRUE))
+
+test$Pred=pred
+test_pred=test%>%
+  ungroup()%>%
+  select(Team1,Prev_SSD1,Rank,Pred)%>%
+  arrange(Pred)%>%
+  mutate(Pred_Rank=row_number(),
+         Probability=1/(1+exp(Pred)))%>%
+  select(Prev_SSD1,Team1,Rank,Pred_Rank,Pred,Probability)%>%
+  rename(Actual_Rank=Rank,Title_Probability=Probability,Season_Start=Prev_SSD1)
+```
+
+```{r echo=FALSE , results='asis'}
+kable(test_pred,caption = '2019-20 Season Prediction')
+```
+
+Voila. We were able to get the title winner correctly and the runner up.Noted that in none of the training data Liverpool had a rank 1 but city had. The model is able to pick up the pattern that Liverpool can finish over just by looking at their improvement in head to heads alone. We have Totenham at 3,where as they finished 6th(fun breakers huh!).Although, this was an off season for them with even finishing in top 4 and a UCL final last season, they were coming off from their best season ever.Considering this outlier the next rankings Man United and Chelsea are spot on.
+
+The lambdarank method provides more prevelance to top ratings than bottom ones.Although,except wolves(due to little data availability),4 out of bottom 5 were in relegation battle with 2 of them actually getting relegated.
+
+
+Now that we have seen the accuracy of predictions on last season, let's see what would be the case at the end of season.
+
+
+
+
+```{r}
+##Load the 2020-21 prediction data
+newtest=import("Pairwise_Ranking_Data_Pred_2020_data.xlsx")
+rel=c('Norwich','Watford','Bournemouth')
+newtest=newtest%>%filter(!Team1%in%rel)
+newtest2=newtest%>%select(-Team1)
+newtest_xgb <- xgb.DMatrix(as.matrix(newtest2))
+pred=(predict(rankModel, newtest_xgb,reshape = TRUE))
+newtest$Pred=pred
+newtest_pred=newtest%>%
+  ungroup()%>%
+  select(Team1,Pred)%>%
+  arrange(Pred)%>%
+  mutate(Prev_SSD1=as.character('2020-09-12'),Pred_Rank=row_number(),
+         Probability=1/(1+exp(Pred)))%>%
+  select(Prev_SSD1,Team1,Pred_Rank,Pred,Probability)%>%
+  rename(Title_Probability=Probability,Season_Start=Prev_SSD1)
+
+```
+
+```{r echo=FALSE , results='asis'}
+kable(newtest_pred,caption = '2020-21 Season Prediction')
+```
+
+
+Noted that this prediction doesn't have leeds as they are in EPL for first time after 2002. With the 19 teams available, Chelsea are predicted to win the league, with Liverpool coming in second,United 3rd and city 4th.With the new signings chelsea have, they could infact aim for it.Although on a football infested mind it's hard to digest city finishing 4th and either of city or liverpool not winning the league.But numbers don't lie. Fingers crossed :D
+
+And for the relagation battle, it's predicted to be between Fulham,WestBrom,Crystal Palace and Aston Villa
